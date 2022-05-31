@@ -3,6 +3,7 @@ use std::error::Error;
 
 mod hack {
     use phf::phf_map;
+    use std::collections::HashMap;
 
     static COMP_MAP: phf::Map<&'static str, &'static str> = phf_map! {
         "0"   => "0101010",
@@ -32,6 +33,7 @@ mod hack {
         "D-M" => "1010011",
         "M-D" => "1000111",
         "D&M" => "1000000",
+        "D|M" => "1010101"
     };
 
     static DEST_MAP: phf::Map<&'static str, &'static str> = phf_map! {
@@ -54,42 +56,145 @@ mod hack {
         "JMP" => "111"
     };
 
-    pub fn strip_comment<'a>(line: &'a str) -> Option<&'a str> {
-        let line_parts: Vec<&str>= line.split("//").take(1).collect();
-        let line = line_parts[0].trim();
+    static VARIABLES: phf::Map<&'static str, i16> = phf_map! {
+        "R0" => 0,
+        "R1" => 1,
+        "R2" => 2,
+        "R3" => 3,
+        "R4" => 4,
+        "R5" => 5,
+        "R6" => 6,
+        "R7" => 7,
+        "R8" => 8,
+        "R9" => 9,
+        "R10" => 10,
+        "R11" => 11,
+        "R12" => 12,
+        "R13" => 13,
+        "R14" => 14,
+        "R15" => 15,
+        "SP" => 0,
+        "LCL" => 1,
+        "ARG" => 2,
+        "THIS" => 3,
+        "THAT" => 4,
+        "SCREEN" => 16384,
+        "KDB" => 24576
+    };
 
-        if line.is_empty() {
-            None
-        } else {
-            Some(line)
+    pub fn strip_comments<'a>(lines: std::str::Lines<'a>) -> Vec<&'a str> {
+        lines.filter_map(|line| {
+            let line_parts: Vec<&str> = line.split("//").collect();
+            let line = line_parts[0].trim();
+
+            if line.is_empty() {
+                None
+            } else {
+                Some(line)
+            }
+        }).collect()
+    }
+
+    pub fn filter_labels<'a>(lines: Vec<&'a str>, symbol_table: & mut SymbolTable) -> Vec<&'a str> {
+        let mut line_count = 0;
+
+        lines.into_iter().filter_map(|line|
+            if line.starts_with("(") && line.ends_with(")") {
+                let symbol = line.strip_prefix("(").unwrap().strip_suffix(")").unwrap();
+                symbol_table.insert_label(symbol, line_count);
+                None
+            } else {
+                line_count = line_count + 1;
+                Some(line)
+            }
+        ).collect()
+    }
+
+    pub fn parse_instructions(lines: Vec<&str>) -> Vec<Instruction> {
+        lines.iter().map(|line|
+            match line.strip_prefix("@") {
+                Some(address) => Instruction::A(address.to_string()),
+                None => Instruction::c_from_string(line)
+            }
+        ).collect()
+    }
+
+    pub fn resolve_symbols<'a>(instructions: Vec<Instruction>, symbol_table: &'a mut SymbolTable) -> Vec<Instruction> {
+        let mut result = Vec::new();
+
+        for instruction in instructions {
+            let i = match instruction {
+                Instruction::A(address) => Instruction::A(symbol_table.apply_to_address(&address)),
+                Instruction::C(d, c, j) => Instruction::C(d, c, j)
+            };
+
+            result.push(i);
+        }
+
+        result
+    }
+
+    pub struct SymbolTable {
+        table: HashMap<String, i16>,
+        variable_count: i16
+    }
+
+    pub fn new_symbol_table() -> SymbolTable {
+        SymbolTable {
+            table: HashMap::new(),
+            variable_count: 16
         }
     }
 
-    pub fn to_instruction(line: &str) -> Instruction {
-        match line.strip_prefix("@") {
-            Some(address) => Instruction::A(address),
-            None => Instruction::c_from_string(line)
+    impl SymbolTable {
+        pub fn insert_label(&mut self, symbol: &str, value: i16) {
+            self.table.insert(symbol.to_string(), value);
+        }
+
+        pub fn apply_to_address<'a>(&'a mut self, address: &'a str) -> String {
+            // check if we just have a number, which is a literal address
+            if address.parse::<i16>().is_ok() {
+                address.to_string()
+            } else {
+                // First try fixed symbols
+                match VARIABLES.get(address) {
+                    Some(value) => value.to_string(),
+                    // Then try variables we've found in the file
+                    None => match self.table.get(address) {
+                        Some(value) => value.to_string(),
+                        None => self.create_new_variable(address)
+                    }
+                }
+            }
+        }
+
+        fn create_new_variable<'a>(&mut self, address: &'a str) -> String {
+            let new_variable = self.variable_count;
+            self.variable_count = self.variable_count + 1;
+            self.table.insert(address.to_string(), new_variable);
+
+            new_variable.to_string()
         }
     }
 
     #[derive(Debug)]
-    pub enum Instruction<'a> {
+    pub enum Instruction {
         // A - address
-        A(&'a str),
+        A(String),
         // C - dest, comp, jump
-        C(&'a str, &'a str, &'a str)
+        C(String, String, String)
     }
 
-    impl Instruction<'_> {
+    impl Instruction {
         fn c_from_string(s: &str) -> Instruction {
             let dest_parts: Vec<&str> = s.split("=").collect();
 
             if dest_parts.len() == 1 {
                 let (comp, jump) = Self::parse_comp_and_jump(dest_parts[0]);
-                Instruction::C("", comp, jump)
+                Instruction::C("".to_string(), comp.to_string(), jump.to_string())
             } else {
                 let (comp, jump) = Self::parse_comp_and_jump(dest_parts[1]);
-                Instruction::C(dest_parts[0], comp, jump)
+                Instruction::C(dest_parts[0].to_string(), comp.to_string(), jump.to_string())
             }
         }
 
@@ -123,16 +228,17 @@ mod hack {
  * Hack Machine language will be output on STDOUT.
  */
 fn main() -> Result<(), Box<dyn Error>> {
+    let mut symbol_table = hack::new_symbol_table();
     let mut input_string = String::new();
     io::stdin().lock().read_to_string(&mut input_string)?;
 
-    let output = input_string.lines();
-    let output = output.filter_map(|line| hack::strip_comment(line));
-    let output = output.map(|line| hack::to_instruction(line));
-    let output = output.map(|instruction| instruction.to_binary());
-    let output = output.collect::<Vec<String>>().join("\n");
+    let lines = hack::strip_comments(input_string.lines());
+    let lines = hack::filter_labels(lines, &mut symbol_table);
+    let instructions = hack::parse_instructions(lines);
+    let instructions = hack::resolve_symbols(instructions, &mut symbol_table);
+    let output: Vec<String> = instructions.iter().map(|instruction| instruction.to_binary()).collect();
 
-    println!("{}", output);
+    println!("{}", output.join("\n"));
 
     Ok(())
 }
